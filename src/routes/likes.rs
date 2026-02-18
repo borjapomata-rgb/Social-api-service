@@ -2,12 +2,15 @@ use axum::{
     routing::{post, delete, get},
     Router,
     Json,
-    extract::{State, Path},
+    extract::{State, Path, Query},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use redis::AsyncCommands;
+use std::collections::HashMap;
+use base64::{engine::general_purpose, Engine as _};
+use sqlx::Row;
 
 use crate::app::AppState;
 
@@ -21,6 +24,8 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/v1/likes/batch/counts", post(batch_get_counts))
         .route("/v1/likes/batch/statuses", post(batch_get_statuses))
+        .route("/v1/likes/user", get(get_user_likes))
+
 
 }
 
@@ -88,6 +93,20 @@ pub struct BatchStatusItem {
     pub liked_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+
+#[derive(Serialize)]
+pub struct UserLikesResponse {
+    pub items: Vec<UserLikeItem>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+#[derive(Serialize)]
+pub struct UserLikeItem {
+    pub content_type: String,
+    pub content_id: String,
+    pub liked_at: chrono::DateTime<chrono::Utc>,
+}
 
 async fn like_content(
     State(state): State<AppState>,
@@ -480,4 +499,108 @@ async fn batch_get_statuses(
     }
 
     Ok(Json(BatchStatusResponse { results }))
+}
+
+
+async fn get_user_likes(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<UserLikesResponse>, (StatusCode, String)> {
+
+    let user_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001")
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid user_id".to_string()))?;
+
+    let limit: i64 = params.get("limit")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(20)
+        .min(50);
+
+    let content_type_filter = params.get("content_type");
+
+    let cursor = params.get("cursor");
+
+    let mut query = String::from(
+        "SELECT content_type, content_id, liked_at
+         FROM likes
+         WHERE user_id = $1"
+    );
+
+    let mut bind_index = 2;
+
+    if let Some(ct) = content_type_filter {
+        query.push_str(&format!(" AND content_type = ${}", bind_index));
+        bind_index += 1;
+    }
+
+    if let Some(cursor_value) = cursor {
+        let decoded = general_purpose::STANDARD.decode(cursor_value)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "INVALID_CURSOR".to_string()))?;
+
+        let cursor_str = String::from_utf8(decoded)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "INVALID_CURSOR".to_string()))?;
+
+        query.push_str(&format!(
+            " AND liked_at < ${}",
+            bind_index
+        ));
+
+        bind_index += 1;
+    }
+
+    query.push_str(" ORDER BY liked_at DESC");
+    query.push_str(&format!(" LIMIT {}", limit + 1));
+
+    let mut q = sqlx::query(&query).bind(user_id);
+
+    if let Some(ct) = content_type_filter {
+        q = q.bind(ct);
+    }
+
+    if let Some(cursor_value) = cursor {
+        let decoded = general_purpose::STANDARD.decode(cursor_value).unwrap();
+        let cursor_str = String::from_utf8(decoded).unwrap();
+        let ts: chrono::DateTime<chrono::Utc> = cursor_str.parse().unwrap();
+        q = q.bind(ts);
+    }
+
+    let rows = q
+        .fetch_all(&state.db)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "DB error".to_string()))?;
+
+    let has_more = rows.len() as i64 > limit;
+
+    let sliced = if has_more {
+        &rows[..limit as usize]
+    } else {
+        &rows[..]
+    };
+
+    let mut items = Vec::new();
+
+    for row in sliced {
+        let content_type: String = row.try_get("content_type").unwrap();
+        let content_id: Uuid = row.try_get("content_id").unwrap();
+        let liked_at: chrono::DateTime<chrono::Utc> = row.try_get("liked_at").unwrap();
+
+        items.push(UserLikeItem {
+            content_type,
+            content_id: content_id.to_string(),
+            liked_at,
+        });
+    }
+
+    let next_cursor = if has_more {
+        let last = sliced.last().unwrap();
+        let ts: chrono::DateTime<chrono::Utc> = last.try_get("liked_at").unwrap();
+        Some(general_purpose::STANDARD.encode(ts.to_string()))
+    } else {
+        None
+    };
+
+    Ok(Json(UserLikesResponse {
+        items,
+        next_cursor,
+        has_more,
+    }))
 }
