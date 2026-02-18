@@ -19,6 +19,9 @@ pub fn routes() -> Router<AppState> {
             "/v1/likes/:content_type/:content_id/count",
             get(get_like_count),
         )
+        .route("/v1/likes/batch/counts", post(batch_get_counts))
+        .route("/v1/likes/batch/statuses", post(batch_get_statuses))
+
 }
 
 #[derive(Deserialize)]
@@ -48,6 +51,43 @@ pub struct CountResponse {
     pub content_id: String,
     pub count: i64,
 }
+
+#[derive(Deserialize)]
+pub struct BatchCountRequest {
+    pub items: Vec<BatchItem>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct BatchItem {
+    pub content_type: String,
+    pub content_id: String,
+}
+
+#[derive(Serialize)]
+pub struct BatchCountResponse {
+    pub results: Vec<BatchCountItem>,
+}
+
+#[derive(Serialize)]
+pub struct BatchCountItem {
+    pub content_type: String,
+    pub content_id: String,
+    pub count: i64,
+}
+
+#[derive(Serialize)]
+pub struct BatchStatusResponse {
+    pub results: Vec<BatchStatusItem>,
+}
+
+#[derive(Serialize)]
+pub struct BatchStatusItem {
+    pub content_type: String,
+    pub content_id: String,
+    pub liked: bool,
+    pub liked_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 
 async fn like_content(
     State(state): State<AppState>,
@@ -274,4 +314,170 @@ async fn get_like_count(
         content_id,
         count: count_row.count.unwrap_or(0),
     }))
+}
+
+async fn batch_get_counts(
+    State(state): State<AppState>,
+    Json(payload): Json<BatchCountRequest>,
+) -> Result<Json<BatchCountResponse>, (StatusCode, String)> {
+
+    if payload.items.len() > 100 {
+        return Err((StatusCode::BAD_REQUEST, "BATCH_TOO_LARGE".to_string()));
+    }
+
+    let mut results = Vec::new();
+    let mut missing = Vec::new();
+
+    // Build cache keys
+    let keys: Vec<String> = payload.items.iter()
+        .map(|item| format!("likes:count:{}:{}", item.content_type, item.content_id))
+        .collect();
+
+    // Try Redis MGET
+    if let Ok(mut conn) = state.redis.get_async_connection().await {
+        let cached: Vec<Option<i64>> = conn.get(keys.clone()).await.unwrap_or_default();
+
+        for (i, value) in cached.iter().enumerate() {
+            if let Some(count) = value {
+                results.push(BatchCountItem {
+                    content_type: payload.items[i].content_type.clone(),
+                    content_id: payload.items[i].content_id.clone(),
+                    count: *count,
+                });
+            } else {
+                missing.push(payload.items[i].clone());
+            }
+        }
+
+        // Fetch missing from DB in ONE query
+        if !missing.is_empty() {
+
+            let mut db_results = Vec::new();
+
+            for item in &missing {
+                let uuid = Uuid::parse_str(&item.content_id)
+                    .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid content_id".to_string()))?;
+
+                let row = sqlx::query!(
+                    r#"
+                    SELECT COUNT(*) as count
+                    FROM likes
+                    WHERE content_type = $1
+                      AND content_id = $2
+                    "#,
+                    item.content_type,
+                    uuid
+                )
+                .fetch_one(&state.db)
+                .await
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "DB error".to_string()))?;
+
+                let count = row.count.unwrap_or(0);
+
+                db_results.push((item.clone(), count));
+            }
+
+            // Update cache
+            for (item, count) in db_results {
+                let key = format!("likes:count:{}:{}", item.content_type, item.content_id);
+
+                let _: Result<(), _> = conn.set_ex(&key, count, 300).await;
+
+                results.push(BatchCountItem {
+                    content_type: item.content_type,
+                    content_id: item.content_id,
+                    count,
+                });
+            }
+        }
+
+        return Ok(Json(BatchCountResponse { results }));
+    }
+
+    // If Redis unavailable → DB only
+    for item in payload.items {
+        let uuid = Uuid::parse_str(&item.content_id)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid content_id".to_string()))?;
+
+        let row = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as count
+            FROM likes
+            WHERE content_type = $1
+              AND content_id = $2
+            "#,
+            item.content_type,
+            uuid
+        )
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "DB error".to_string()))?;
+
+        results.push(BatchCountItem {
+            content_type: item.content_type,
+            content_id: item.content_id,
+            count: row.count.unwrap_or(0),
+        });
+    }
+
+    Ok(Json(BatchCountResponse { results }))
+}
+
+async fn batch_get_statuses(
+    State(state): State<AppState>,
+    Json(payload): Json<BatchCountRequest>, // reuse same request struct
+) -> Result<Json<BatchStatusResponse>, (StatusCode, String)> {
+
+    if payload.items.len() > 100 {
+        return Err((StatusCode::BAD_REQUEST, "BATCH_TOO_LARGE".to_string()));
+    }
+
+    // TEMP hardcoded user_id
+    let user_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001")
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid user_id".to_string()))?;
+
+    let mut results = Vec::new();
+
+    for item in payload.items {
+
+        let uuid = Uuid::parse_str(&item.content_id)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid content_id".to_string()))?;
+
+        let row = sqlx::query!(
+            r#"
+            SELECT liked_at
+            FROM likes
+            WHERE user_id = $1
+              AND content_type = $2
+              AND content_id = $3
+            "#,
+            user_id,
+            item.content_type,
+            uuid
+        )
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "DB error".to_string()))?;
+
+        match row {
+            Some(r) => {
+                results.push(BatchStatusItem {
+                    content_type: item.content_type,
+                    content_id: item.content_id,
+                    liked: true,
+                    liked_at: Some(r.liked_at),
+                });
+            }
+            None => {
+                results.push(BatchStatusItem {
+                    content_type: item.content_type,
+                    content_id: item.content_id,
+                    liked: false,
+                    liked_at: None,
+                });
+            }
+        }
+    }
+
+    Ok(Json(BatchStatusResponse { results }))
 }
