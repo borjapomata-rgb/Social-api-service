@@ -128,7 +128,7 @@ Behavior:
 
 ---
 
-## 3️⃣ Get Like Count (Public)
+## 3️⃣ Get Like Count
 
 GET /v1/likes/{content_type}/{content_id}/count
 
