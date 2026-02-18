@@ -1,10 +1,12 @@
 use axum::{
-    routing::post,
+    routing::{post,delete},
     Router,
     Json,
     extract::State,
     http::StatusCode,
+    extract::Path,
 };
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -13,6 +15,8 @@ use crate::app::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/likes", post(like_content))
+        .route("/v1/likes/:content_type/:content_id", delete(unlike_content))
+
 }
 
 #[derive(Deserialize)]
@@ -116,4 +120,67 @@ async fn like_content(
     };
 
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+
+async fn unlike_content(
+    State(state): State<AppState>,
+    Path((content_type, content_id)): Path<(String, String)>,
+) -> Result<(StatusCode, Json<UnlikeResponse>), (StatusCode, String)> {
+
+    // TEMP hardcoded user_id
+    let user_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001")
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid user_id".to_string()))?;
+
+    let content_uuid = Uuid::parse_str(&content_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid content_id".to_string()))?;
+
+    // Delete row
+    let result = sqlx::query!(
+        r#"
+        DELETE FROM likes
+        WHERE user_id = $1
+          AND content_type = $2
+          AND content_id = $3
+        RETURNING liked_at
+        "#,
+        user_id,
+        content_type,
+        content_uuid
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "DB error".to_string()))?;
+
+    let was_liked = result.is_some();
+
+    // Count remaining likes
+    let count_row = sqlx::query!(
+        r#"
+        SELECT COUNT(*) as count
+        FROM likes
+        WHERE content_type = $1
+          AND content_id = $2
+        "#,
+        content_type,
+        content_uuid
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "DB error".to_string()))?;
+
+    let response = UnlikeResponse {
+        liked: false,
+        was_liked,
+        count: count_row.count.unwrap_or(0),
+    };
+
+    Ok((StatusCode::OK, Json(response)))
+}
+
+#[derive(Serialize)]
+pub struct UnlikeResponse {
+    pub liked: bool,
+    pub was_liked: bool,
+    pub count: i64,
 }
